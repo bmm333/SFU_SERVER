@@ -1,0 +1,2 @@
+Repo of Acadex SFU server. 
+The responsability of this server is to handle all realtime media traffic while Acadex provides signaling auth and collab tools. Achiving Scalability, Security and a Clean Architecture
