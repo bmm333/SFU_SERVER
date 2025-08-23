@@ -1,16 +1,27 @@
 {
   "name": "sfu_server",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "SFU Server for Acadex platform",
+  "main": "src/server.js",
   "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
+  "keywords": [
+    "sfu",
+    "webrtc",
+    "mediasoup",
+    "education"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "dotenv": "^17.2.1",
     "mediasoup": "^3.18.0",
     "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
   }
 }

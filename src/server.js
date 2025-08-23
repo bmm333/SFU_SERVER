@@ -1,36 +1,46 @@
-const { createWorker } = require("mediasoup");
+const { createWorker } = require('./mediasoup');
+const config = require('./config');
+const WebSocket = require('ws');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
 
-class SFUServer{
-    constructor()
-    {this.clients=new Map();
-    this.sessions=new Map();
-    this.transports=new Map();
-    this.producers=new Map();
-    this.consumers=new Map();
-    this.router=null;
+class SFUServer {
+    constructor() {
+        this.clients = new Map();
+        this.sessions = new Map();
+        this.transports = new Map();
+        this.producers = new Map();
+        this.consumers = new Map();
+        this.router = null;
     }
-    async initalize()
-    {
-        try{
-            const {router}=await createWorker();
-            this.router=router;
-            //Https server for Ws (for webrtc)
-            const server=https.createServer({
-                cert:fs.readFileSync(path.join(__dirname,'../certs/cert.pem')),
-                key:fs.readFileSync(path.join(__dirname,'../certs/key.pem'))
+
+    async initialize() {
+        try {
+            const { router } = await createWorker();
+            this.router = router;
+            
+            // HTTPS server for WebSocket (required for WebRTC)
+            const server = https.createServer({
+                cert: fs.readFileSync(config.ssl.certPath),
+                key: fs.readFileSync(config.ssl.keyPath)
             });
-            this.wss=new WebSocket.Server({
+            
+            this.wss = new WebSocket.Server({
                 server,
-                path:'/sfu'
+                path: config.network.wsPath
             });
+            
             this.setupWebSocketHandlers();
-            const port=process.env.SFU_PORT||3001;
-            server.listen(port,()=>{
-                console.log(`SFU Server running on port ${port}`);
-            })
-        }catch(error)
-        {
-            console.error('Failed to initialize SFU server: ',error);
+            
+            server.listen(config.server.port, () => {
+                console.log(`SFU Server running on port ${config.server.port}`);
+                console.log(`Environment: ${config.server.nodeEnv}`);
+                console.log(`Announced IP: ${config.mediasoup.webRtcTransport.listenIps[0].announcedIp}`);
+            });
+            
+        } catch (error) {
+            console.error('Failed to initialize SFU server:', error);
             process.exit(1);
         }
     }
@@ -66,11 +76,11 @@ class SFUServer{
             case'join':
                 await this.handleJoin(ws,payload);
                 break;
-            case 'createTrasport':
-                await this.handleCreateTrasport(ws,payload);
+            case 'createTransport':
+                await this.handleCreateTransport(ws,payload);
                 break;
-            case 'connectTrasport':
-                await this.handleConnectTrasport(ws,payload);
+            case 'connectTransport':
+                await this.handleConnectTransport(ws,payload);
                 break;
             case 'produce':
                 await this.handleProduce(ws,payload);
@@ -103,9 +113,9 @@ class SFUServer{
                 sessionId,
                 userId,
                 userInfo,
-                trasports:new Set(),
-                produces:new Set(),
-                consumers:new Set()
+                transports: new Set(),
+                producers: new Set(), 
+                consumers: new Set()
             });
             if(!this.sessions.has(sessionId)) {
                 this.sessions.set(sessionId,{
@@ -125,9 +135,9 @@ class SFUServer{
             this.sendError(ws,'Failed to join session');
         }
     }
-    async handleCreateTrasport(ws,payload)
+    async handleCreateTransport(ws,payload)
     {
-        const{direction}=payload; //either send or rcv
+        const{direction}=payload; //either send or recv
         const client=this.clients.get(ws.clientId);
 
         if(!client)
@@ -144,12 +154,12 @@ class SFUServer{
                 preferUdp: true,
                 enableSctp: direction==='send'
             });
-            this.transports.set(trasport.id,{
+            this.transports.set(transport.id,{
                 transport,
                 clientId:ws.clientId,
                 direction
             });
-            client.transport.add(transport.id);
+            client.transports.add(transport.id);
             transport.on('dtlsstatechange', (dtlsState) => {
                 if (dtlsState === 'closed') {
                     this.cleanupTransport(transport.id);
@@ -165,10 +175,273 @@ class SFUServer{
         }catch(error)
         {
             console.error('Create transport error: ',error);
-            this.sendError(ws,'Failed to create trasport');
+            this.sendError(ws,'Failed to create transport');
         }
     }
-    /*going to add other handles but closing for now need to overview acadex backend */
+    async handleConnectTransport(ws, payload) {
+        const { transportId, dtlsParameters } = payload;
+        const transportData = this.transports.get(transportId);
+        
+        if (!transportData) {
+            return this.sendError(ws, 'Transport not found');
+        }
+
+        try {
+            await transportData.transport.connect({ dtlsParameters });
+            this.sendMessage(ws, 'transportConnected', { transportId });
+        } catch (error) {
+            console.error('Connect transport error:', error);
+            this.sendError(ws, 'Failed to connect transport');
+        }
+    }
+
+    async handleProduce(ws, payload) {
+        const { transportId, kind, rtpParameters, appData } = payload;
+        const client = this.clients.get(ws.clientId);
+        const transportData = this.transports.get(transportId);
+        
+        if (!client || !transportData) {
+            return this.sendError(ws, 'Client or transport not found');
+        }
+
+        try {
+            const producer = await transportData.transport.produce({
+                kind,
+                rtpParameters,
+                appData: { ...appData, clientId: ws.clientId, userId: client.userId }
+            });
+
+            this.producers.set(producer.id, {
+                producer,
+                clientId: ws.clientId,
+                kind,
+                sessionId: client.sessionId
+            });
+
+            client.producers.add(producer.id);
+
+            // Add to session producers
+            const session = this.sessions.get(client.sessionId);
+            session.producers.add(producer.id);
+
+            producer.on('transportclose', () => {
+                this.cleanupProducer(producer.id);
+            });
+
+            this.sendMessage(ws, 'produced', { 
+                producerId: producer.id,
+                kind 
+            });
+
+            // Notify other clients in session about new producer
+            this.notifyNewProducer(client.sessionId, producer.id, client.userId, kind, ws.clientId);
+
+        } catch (error) {
+            console.error('Produce error:', error);
+            this.sendError(ws, 'Failed to produce');
+        }
+    }
+
+    async handleConsume(ws, payload) {
+        const { transportId, producerId, rtpCapabilities } = payload;
+        const client = this.clients.get(ws.clientId);
+        const transportData = this.transports.get(transportId);
+        const producerData = this.producers.get(producerId);
+        
+        if (!client || !transportData || !producerData) {
+            return this.sendError(ws, 'Client, transport, or producer not found');
+        }
+
+        try {
+            // Check if router can consume
+            if (!this.router.canConsume({
+                producerId,
+                rtpCapabilities
+            })) {
+                return this.sendError(ws, 'Cannot consume');
+            }
+
+            const consumer = await transportData.transport.consume({
+                producerId,
+                rtpCapabilities,
+                paused: true // Start paused
+            });
+
+            this.consumers.set(consumer.id, {
+                consumer,
+                clientId: ws.clientId,
+                producerId
+            });
+
+            client.consumers.add(consumer.id);
+
+            consumer.on('transportclose', () => {
+                this.cleanupConsumer(consumer.id);
+            });
+
+            consumer.on('producerclose', () => {
+                this.cleanupConsumer(consumer.id);
+                this.sendMessage(ws, 'consumerClosed', { consumerId: consumer.id });
+            });
+
+            this.sendMessage(ws, 'consumed', {
+                consumerId: consumer.id,
+                producerId,
+                kind: consumer.kind,
+                rtpParameters: consumer.rtpParameters,
+                paused: consumer.paused
+            });
+
+        } catch (error) {
+            console.error('Consume error:', error);
+            this.sendError(ws, 'Failed to consume');
+        }
+    }
+
+    async handleResume(ws, payload) {
+        const { consumerId } = payload;
+        const consumerData = this.consumers.get(consumerId);
+        
+        if (!consumerData || consumerData.clientId !== ws.clientId) {
+            return this.sendError(ws, 'Consumer not found');
+        }
+
+        try {
+            await consumerData.consumer.resume();
+            this.sendMessage(ws, 'resumed', { consumerId });
+        } catch (error) {
+            console.error('Resume error:', error);
+            this.sendError(ws, 'Failed to resume consumer');
+        }
+    }
+
+    async handlePause(ws, payload) {
+        const { consumerId, producerId } = payload;
+        
+        if (consumerId) {
+            const consumerData = this.consumers.get(consumerId);
+            if (consumerData && consumerData.clientId === ws.clientId) {
+                try {
+                    await consumerData.consumer.pause();
+                    this.sendMessage(ws, 'paused', { consumerId });
+                } catch (error) {
+                    this.sendError(ws, 'Failed to pause consumer');
+                }
+            }
+        }
+        
+        if (producerId) {
+            const producerData = this.producers.get(producerId);
+            if (producerData && producerData.clientId === ws.clientId) {
+                try {
+                    await producerData.producer.pause();
+                    this.sendMessage(ws, 'paused', { producerId });
+                    this.notifyProducerPaused(producerData.sessionId, producerId, ws.clientId);
+                } catch (error) {
+                    this.sendError(ws, 'Failed to pause producer');
+                }
+            }
+        }
+    }
+
+    async handleClose(ws, payload) {
+        const { consumerId, producerId } = payload;
+        
+        if (consumerId) {
+            this.cleanupConsumer(consumerId);
+        }
+        
+        if (producerId) {
+            this.cleanupProducer(producerId);
+        }
+    }
+
+    notifyNewProducer(sessionId, producerId, userId, kind, excludeClientId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+
+        for (const clientId of session.clients) {
+            if (clientId !== excludeClientId) {
+                const client = this.clients.get(clientId);
+                if (client) {
+                    this.sendMessage(client.ws, 'newProducer', {
+                        producerId,
+                        userId,
+                        kind
+                    });
+                }
+            }
+        }
+    }
+
+    notifyProducerPaused(sessionId, producerId, excludeClientId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+
+        for (const clientId of session.clients) {
+            if (clientId !== excludeClientId) {
+                const client = this.clients.get(clientId);
+                if (client) {
+                    this.sendMessage(client.ws, 'producerPaused', { producerId });
+                }
+            }
+        }
+    }
+
+    notifyProducerClosed(sessionId, producerId, excludeClientId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+
+        for (const clientId of session.clients) {
+            if (clientId !== excludeClientId) {
+                const client = this.clients.get(clientId);
+                if (client) {
+                    this.sendMessage(client.ws, 'producerClosed', { producerId });
+                }
+            }
+        }
+    }
+
+    // Cleanup methods
+    cleanupProducer(producerId) {
+        const producerData = this.producers.get(producerId);
+        if (producerData) {
+            producerData.producer.close();
+            
+            // Remove from session
+            const session = this.sessions.get(producerData.sessionId);
+            if (session) {
+                session.producers.delete(producerId);
+            }
+            
+            // Remove from client
+            const client = this.clients.get(producerData.clientId);
+            if (client) {
+                client.producers.delete(producerId);
+            }
+            
+            this.producers.delete(producerId);
+            
+            // Notify other clients
+            this.notifyProducerClosed(producerData.sessionId, producerId, producerData.clientId);
+        }
+    }
+
+    cleanupConsumer(consumerId) {
+        const consumerData = this.consumers.get(consumerId);
+        if (consumerData) {
+            consumerData.consumer.close();
+            
+            // Remove from client
+            const client = this.clients.get(consumerData.clientId);
+            if (client) {
+                client.consumers.delete(consumerId);
+            }
+            
+            this.consumers.delete(consumerId);
+        }
+    }
+    /*going to add other handles but closing for now need to overview acadex backend.. Done */
     generateClientId() {
         return Math.random().toString(36).substr(2, 9);
     }
